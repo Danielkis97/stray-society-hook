@@ -15,7 +15,7 @@ import {IFeeSink} from "../interfaces/IProtocol.sol";
 
 /// @title StrayFeeHook
 /// @notice Takes §8's trading fee, in ETH, on every swap through the pool: 3.00 % buying,
-///         4.00 % selling, plus a launch surcharge: both sides open at 30 % and fall one
+///         4.00 % selling, plus a launch surcharge: both sides open at 90 % and fall in a straight
 ///         percentage point a minute until they reach the permanent rate, after 27 minutes.
 ///
 /// @dev ## Why a hook and not a router
@@ -64,17 +64,17 @@ import {IFeeSink} from "../interfaces/IProtocol.sol";
 ///
 ///      ## The launch surcharge
 ///
-///      For the first minutes the fee carries a surcharge on top of the permanent rate. Both
-///      sides open at 30 % and fall one percentage point a minute, second by second: the
-///      sell side meets its 4.00 % at 26 minutes, the buy side its 3.00 % at 27, and the cut-off
-///      at 27 minutes is therefore a formality. At the ten-minute mark both sides pay 20 %.
+///      For the first three hours the fee carries a surcharge on top of the permanent rate
+///      (owner's decision of 2026-10-05, after CACHE FLOW on this chain, which opened at 90 %
+///      falling to 3 % over three hours). Both sides open at 90 % and fall in a straight line,
+///      second by second, to the buy side's 3.00 % at exactly three hours; the sell side meets its
+///      4.00 % a little earlier (2 h 57 min 56 s). One hour in both sides pay 61 %, two hours in 32 %.
 ///
-///      It is not anti-snipe protection and is not sold as such. On this chain ordering is
-///      first-come-first-served with no public mempool and no priority auction, so the
-///      first buyer is decided by network latency and no fee schedule changes that. What a
-///      surcharge changes is what that buyer pays. The trade-off of a long window, accepted
-///      by the owner (2026-10-03): bots can simply wait it out, so it mostly charges the
-///      people who show up early, and what it collects goes to liquidity first (§8).
+///      What it changes is what the first buyers pay. On this chain ordering is first-come-
+///      first-served with no public mempool and no priority auction, so a sniper is decided by
+///      latency; a 90 % opening makes the snipe itself worthless, and what it collects goes to
+///      liquidity first (§8). Known and accepted: token scanners flag a sell tax above 25 %, and
+///      the sell side sits above that line for the first 2 h 14 min.
 ///
 ///      The curve is strictly decreasing, which is a hard requirement rather than an
 ///      aesthetic one: aggregator safety classifiers reject hooks whose settlement can come
@@ -172,22 +172,17 @@ contract StrayFeeHook is IHooks {
     uint24 public constant BUY_FEE_BPS = F.BUY_FEE_BPS;
     uint24 public constant SELL_FEE_BPS = F.SELL_FEE_BPS;
 
-    /// @notice The total rate at the instant the pool opens, the same on both sides: 30 %.
-    /// @dev Owner's decision of 2026-10-03: one curve for buying and selling, nothing more
-    ///      complicated, starting at 30 %. Known and accepted: for its first five minutes the
-    ///      sell side sits above the 2,500 bp line some token scanners flag as a high sell tax.
-    uint24 public constant LAUNCH_START_BPS = 3000;
+    /// @notice The total rate at the instant the pool opens, the same on both sides: 90 %.
+    /// @dev Owner's decision of 2026-10-05 (was 30 % falling over 27 minutes): one curve for buying
+    ///      and selling, opening where CACHE FLOW opened on this chain.
+    uint24 public constant LAUNCH_START_BPS = 9000;
 
-    /// @notice How fast the rate falls: one percentage point a minute, second by second.
-    uint24 public constant LAUNCH_DECAY_BPS_PER_MINUTE = 100;
-
-    /// @notice When the surcharge is over on both sides: 27 minutes.
-    /// @dev The buy side reaches its permanent 3.00 % at exactly 27 minutes, the sell side
-    ///      its 4.00 % at 26. From there the curve sits on the permanent rate, so crossing this
-    ///      line changes the rate by exactly nothing -- a step here would be a free, riskless
+    /// @notice When the surcharge is over on both sides: three hours.
+    /// @dev The buy side reaches its permanent 3.00 % at exactly three hours, the sell side its
+    ///      4.00 % a little before. From there the curve sits on the permanent rate, so crossing
+    ///      this line changes the rate by exactly nothing -- a step here would be a free, riskless
     ///      target, and a step UP anywhere would lose the aggregator routing the curve keeps.
-    uint64 public constant LAUNCH_WINDOW =
-        uint64((LAUNCH_START_BPS - F.BUY_FEE_BPS) / LAUNCH_DECAY_BPS_PER_MINUTE) * 1 minutes;
+    uint64 public constant LAUNCH_WINDOW = 3 hours;
 
     // ---------------------------------------------------------------------
     // What has been taken and not yet handed on
@@ -335,17 +330,16 @@ contract StrayFeeHook is IHooks {
 
     /// @notice What a swap in this direction is charged at this instant, in basis points.
     ///
-    /// @dev `max(permanent, 30 % - 1 % x elapsed minutes)`, computed per second in integers.
+    /// @dev `max(permanent, 90 % - 87 % x elapsed / 3 hours)`, computed per second in integers.
     ///
-    ///      The decay is `elapsed x 100 / 60` basis points: 1.67 a second, so the rate falls
-    ///      by one or two basis points every second and never stands still while it is above
-    ///      the permanent rate. The truncation is the protocol's way (§0): it rounds the
-    ///      decay down, never the rate.
+    ///      The decay is `elapsed x 8,700 / 10,800` basis points: 0.81 a second, so the rate
+    ///      falls by one basis point in four seconds out of five. The truncation is the
+    ///      protocol's way (§0): it rounds the decay down, never the rate.
     ///
-    ///      What matters most is that the curve is strictly decreasing at every second until
-    ///      it meets the permanent rate, and flat after. A quote can then never settle worse
-    ///      than it was given -- which is the thing aggregator safety classifiers actually
-    ///      test, and losing their routing would cost more than this surcharge can collect.
+    ///      What matters most is that the curve never goes up: it falls until it meets the
+    ///      permanent rate and is flat after. A quote can then never settle worse than it was
+    ///      given -- which is the thing aggregator safety classifiers actually test, and losing
+    ///      their routing would cost more than this surcharge can collect.
     function currentFeeBps(bool buying) public view returns (uint24) {
         uint24 permanent = buying ? BUY_FEE_BPS : SELL_FEE_BPS;
         if (!poolBound) return permanent;
@@ -353,7 +347,7 @@ contract StrayFeeHook is IHooks {
         uint64 elapsed = uint64(block.timestamp) - launchedAt;
         if (elapsed >= LAUNCH_WINDOW) return permanent;
 
-        uint256 decay = (uint256(elapsed) * LAUNCH_DECAY_BPS_PER_MINUTE) / 1 minutes;
+        uint256 decay = (uint256(elapsed) * (LAUNCH_START_BPS - F.BUY_FEE_BPS)) / LAUNCH_WINDOW;
         if (decay >= LAUNCH_START_BPS - permanent) return permanent;
         return uint24(LAUNCH_START_BPS - decay);
     }
