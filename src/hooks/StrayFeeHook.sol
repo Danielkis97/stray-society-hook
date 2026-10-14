@@ -16,7 +16,7 @@ import {IFeeSink} from "../interfaces/IProtocol.sol";
 /// @title StrayFeeHook
 /// @notice Takes §8's trading fee, in ETH, on every swap through the pool: 3.00 % buying,
 ///         4.00 % selling, plus a launch surcharge: both sides open at 90 % and fall in a straight
-///         percentage point a minute until they reach the permanent rate, after 27 minutes.
+///         line, second by second, to the permanent rate after one hour (46.5 % after 30 minutes).
 ///
 /// @dev ## Why a hook and not a router
 ///
@@ -58,17 +58,38 @@ import {IFeeSink} from "../interfaces/IProtocol.sol";
 ///      sink because it is immutable here.
 ///
 ///      Volume reporting is telemetry. Telemetry must not be able to stop trading. So the
-///      swap path now does exactly two things -- take the fee, add it to a counter -- and
+///      swap path does two things with money -- take the fee, add it to a counter -- and
 ///      `flush()` moves it on. `flush` is permissionless and has no deadline; if the router
 ///      is ever unable to accept, the ether simply stays here until it can.
 ///
+///      ## The oracle is kept current by the trades themselves
+///
+///      After every swap the hook pokes V4PoolOracle.observe() (owner's decision of 2026-10-08),
+///      the way a Uniswap v3 pool writes its own observation on a trade. Called after the swap,
+///      the oracle books the old price for exactly the time it stood and takes the new one as
+///      current: a price pushed and pushed back in one block counts for zero seconds, where a
+///      keeper poking every ten minutes could leave a sandwiched reading standing for ten. And
+///      the keeper only has to poke when nobody trades.
+///
+///      The oracle cannot stop trading. It is a raw call with a fixed gas allowance and no
+///      return data copied, so neither a revert, nor an oracle that burns its whole allowance,
+///      nor a huge return value can make the swap fail. What a swap must bring is the gas the
+///      poke actually uses: a poke that failed for want of gas reverts the swap. Skipping it
+///      instead would skip it for nearly every trade, because a wallet sends the lowest gas
+///      limit at which its trade succeeds (eth_estimateGas), and that limit would be the one
+///      without the poke (test_aTradeAtTheWalletsEstimatedGasStillPokes). Starvation is told
+///      apart from a refusal after the call, as Safe and ERC-4337 do: EIP-150 leaves the caller
+///      a 64th of what it had, so a failed call that left less than a 63rd of the allowance was
+///      starved. Nothing is demanded up front, so a router that sends the gas a simulation
+///      used plus a margin gets through too (test_aTradeAtTheGasUsedTimesAMarginStillPokes).
+///
 ///      ## The launch surcharge
 ///
-///      For the first three hours the fee carries a surcharge on top of the permanent rate
-///      (owner's decision of 2026-10-05, after CACHE FLOW on this chain, which opened at 90 %
-///      falling to 3 % over three hours). Both sides open at 90 % and fall in a straight line,
-///      second by second, to the buy side's 3.00 % at exactly three hours; the sell side meets its
-///      4.00 % a little earlier (2 h 57 min 56 s). One hour in both sides pay 61 %, two hours in 32 %.
+///      For the first hour the fee carries a surcharge on top of the permanent rate (owner's decision
+///      of 2026-10-05 to open at 90 % as CACHE FLOW did on this chain; of 2026-10-14 to fall over one
+///      hour, not three). Both sides open at 90 % and fall in a straight line, second by second, to the
+///      buy side's 3.00 % at exactly one hour; the sell side meets its 4.00 % a little earlier
+///      (59 min 19 s). Fifteen minutes in both sides pay 68.25 %, thirty minutes in 46.5 %.
 ///
 ///      What it changes is what the first buyers pay. On this chain ordering is first-come-
 ///      first-served with no public mempool and no priority auction, so a sniper is decided by
@@ -144,6 +165,14 @@ contract StrayFeeHook is IHooks {
     ///      auditing this contract should find it without having to look for it.
     address public immutable BUYBACK;
 
+    /// @notice The depth and price oracle poked after every swap. Zero: no poke.
+    address public immutable ORACLE;
+
+    /// @notice The most gas the poke may use, a cap and not a demand. V4PoolOracle.observe costs
+    ///         at most 169,086 against the real chain's Chainlink feed, everything cold and a ring
+    ///         slot written for the first time (test_theDearestPokeOnTheRealChain).
+    uint256 public constant OBSERVE_GAS = 250_000;
+
     // ---------------------------------------------------------------------
     // The pool this hook is for, pinned as far as it can be before mining
     // ---------------------------------------------------------------------
@@ -177,12 +206,12 @@ contract StrayFeeHook is IHooks {
     ///      and selling, opening where CACHE FLOW opened on this chain.
     uint24 public constant LAUNCH_START_BPS = 9000;
 
-    /// @notice When the surcharge is over on both sides: three hours.
-    /// @dev The buy side reaches its permanent 3.00 % at exactly three hours, the sell side its
+    /// @notice When the surcharge is over on both sides: one hour (owner, 2026-10-14; was three).
+    /// @dev The buy side reaches its permanent 3.00 % at exactly one hour, the sell side its
     ///      4.00 % a little before. From there the curve sits on the permanent rate, so crossing
     ///      this line changes the rate by exactly nothing -- a step here would be a free, riskless
     ///      target, and a step UP anywhere would lose the aggregator routing the curve keeps.
-    uint64 public constant LAUNCH_WINDOW = 3 hours;
+    uint64 public constant LAUNCH_WINDOW = 1 hours;
 
     // ---------------------------------------------------------------------
     // What has been taken and not yet handed on
@@ -268,6 +297,8 @@ contract StrayFeeHook is IHooks {
     error AlreadyBound();
     error ZeroAddress();
     error NothingToFlush();
+    /// @notice The swap did not bring the gas for the oracle poke; send it with a higher limit.
+    error OutOfGasForOracle();
 
     modifier onlyPoolManager() {
         if (msg.sender != address(POOL_MANAGER)) revert NotPoolManager();
@@ -280,7 +311,8 @@ contract StrayFeeHook is IHooks {
         address buyback,
         address expectedCurrency1,
         uint24 expectedFee,
-        int24 expectedTickSpacing
+        int24 expectedTickSpacing,
+        address oracle
     ) {
         if (
             poolManager == address(0) || feeSink == address(0) || buyback == address(0)
@@ -293,6 +325,7 @@ contract StrayFeeHook is IHooks {
         EXPECTED_CURRENCY1 = expectedCurrency1;
         EXPECTED_FEE = expectedFee;
         EXPECTED_TICK_SPACING = expectedTickSpacing;
+        ORACLE = oracle;
 
         // The PoolManager reads the permissions from the low bits of this address, so a
         // hook only works if it was deployed to a mined one. Checking here turns a silent
@@ -330,11 +363,11 @@ contract StrayFeeHook is IHooks {
 
     /// @notice What a swap in this direction is charged at this instant, in basis points.
     ///
-    /// @dev `max(permanent, 90 % - 87 % x elapsed / 3 hours)`, computed per second in integers.
+    /// @dev `max(permanent, 90 % - 87 % x elapsed / 1 hour)`, computed per second in integers.
     ///
-    ///      The decay is `elapsed x 8,700 / 10,800` basis points: 0.81 a second, so the rate
-    ///      falls by one basis point in four seconds out of five. The truncation is the
-    ///      protocol's way (§0): it rounds the decay down, never the rate.
+    ///      The decay is `elapsed x 8,700 / 3,600` basis points: 2.42 a second, so the rate falls
+    ///      every second. The truncation is the protocol's way (§0): it rounds the decay down,
+    ///      never the rate.
     ///
     ///      What matters most is that the curve never goes up: it falls until it meets the
     ///      permanent rate and is flat after. A quote can then never settle worse than it was
@@ -468,6 +501,7 @@ contract StrayFeeHook is IHooks {
         bytes calldata
     ) external onlyPoolManager returns (bytes4, int128) {
         _requireOurPool(key);
+        _observe();
         if (params.zeroForOne) return (IHooks.afterSwap.selector, 0); // handled in beforeSwap
 
         // amount0 is what the swapper receives in currency0, so it is positive here.
@@ -495,6 +529,25 @@ contract StrayFeeHook is IHooks {
 
         // A positive return reduces what the swapper walks away with by exactly the fee.
         return (IHooks.afterSwap.selector, int128(int256(fee)));
+    }
+
+    /// @dev The oracle poke after a swap. Reverts only when the poke was starved of gas, never for
+    ///      anything the oracle does: see "The oracle is kept current by the trades themselves"
+    ///      above. Assembly only to leave the return data uncopied.
+    function _observe() internal {
+        address oracle = ORACLE;
+        if (oracle == address(0)) return;
+        bytes4 sel = bytes4(keccak256("observe()"));
+        uint256 allowance = OBSERVE_GAS;
+        bool ok;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, sel)
+            ok := call(allowance, oracle, 0, ptr, 4, 0, 0)
+        }
+        // Handed less than the allowance, the call kept a 64th of what was left and that is all
+        // that is left now. An oracle that refused, or burned its full allowance, leaves more.
+        if (!ok && gasleft() < allowance / 63) revert OutOfGasForOracle();
     }
 
     // =====================================================================
