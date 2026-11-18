@@ -8,6 +8,8 @@ trading fee on every swap, in ETH, and hands it to the protocol's revenue router
 | Contract | [`src/hooks/StrayFeeHook.sol`](src/hooks/StrayFeeHook.sol) |
 | Pool manager | Uniswap v4 `0x8366a39CC670B4001A1121B8F6A443A643e40951` (Robinhood Chain) |
 | Permissions | `afterInitialize`, `beforeSwap`, `afterSwap`, `beforeSwapReturnDelta`, `afterSwapReturnDelta` |
+| Deployed | [`0xD0849FB0C69c7ACe0af96cdAFd6D3A27ee0890CC`](https://repo.sourcify.dev/4663/0xD0849FB0C69c7ACe0af96cdAFd6D3A27ee0890CC) (Robinhood Chain, source verified on Sourcify) |
+| Pool | `0xf9dde077e1a4c026d8b930480b993d819348bba78b9ae4ab9e5a37d9956e9c6c` ($STRAY/ETH, fee 0, tick spacing 60) |
 | Upgradeable | No. No owner, no admin function, no proxy. |
 | Custom swap data | None. Swaps need no `hookData`. |
 
@@ -20,7 +22,7 @@ trading fee on every swap, in ETH, and hands it to the protocol's revenue router
 - **One pool only:** the hook serves the one pool its launch contract opened; a second pool on the
   same hook is refused.
 - The fee rate follows the pool's measured depth in four states (FeeSplits.sol); during the first
-  three hours after launch a launch rate applies that starts at 90 % and falls in a straight line.
+  hour after launch a launch rate applies that starts at 90 % and falls in a straight line to the normal fee.
 
 The fee leaves the hook only towards the revenue router named at deployment; the hook holds no
 other funds and has no function that sends to an address someone passes in.
